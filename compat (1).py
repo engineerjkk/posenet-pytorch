@@ -1,12 +1,29 @@
-from .core import *
-from .codec import *
+try:
+    from urllib.parse import urljoin
+except ImportError:
+    from urlparse import urljoin
 
-def ToASCII(label):
-    return encode(label)
 
-def ToUnicode(label):
-    return decode(label)
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 
-def nameprep(s):
-    raise NotImplementedError('IDNA 2008 does not utilise nameprep protocol')
 
+# Handle the case where the requests module has been patched to not have
+# urllib3 bundled as part of its source.
+try:
+    from pip._vendor.requests.packages.urllib3.response import HTTPResponse
+except ImportError:
+    from pip._vendor.urllib3.response import HTTPResponse
+
+try:
+    from pip._vendor.requests.packages.urllib3.util import is_fp_closed
+except ImportError:
+    from pip._vendor.urllib3.util import is_fp_closed
+
+# Replicate some six behaviour
+try:
+    text_type = unicode
+except NameError:
+    text_type = str
