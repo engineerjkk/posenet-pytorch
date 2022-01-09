@@ -1,252 +1,142 @@
-from __future__ import absolute_import, division, unicode_literals
+import logging
+import re
+from typing import Container, Iterator, List, Optional, Union
 
-from xml.dom import Node
-from ..constants import namespaces, voidElements, spaceCharacters
+from pip._vendor.packaging.version import LegacyVersion, Version
 
-__all__ = ["DOCUMENT", "DOCTYPE", "TEXT", "ELEMENT", "COMMENT", "ENTITY", "UNKNOWN",
-           "TreeWalker", "NonRecursiveTreeWalker"]
+from pip._internal.utils.misc import stdlib_pkgs  # TODO: Move definition here.
 
-DOCUMENT = Node.DOCUMENT_NODE
-DOCTYPE = Node.DOCUMENT_TYPE_NODE
-TEXT = Node.TEXT_NODE
-ELEMENT = Node.ELEMENT_NODE
-COMMENT = Node.COMMENT_NODE
-ENTITY = Node.ENTITY_NODE
-UNKNOWN = "<#UNKNOWN#>"
+DistributionVersion = Union[LegacyVersion, Version]
 
-spaceCharacters = "".join(spaceCharacters)
+logger = logging.getLogger(__name__)
 
 
-class TreeWalker(object):
-    """Walks a tree yielding tokens
+class BaseDistribution:
+    @property
+    def location(self):
+        # type: () -> Optional[str]
+        """Where the distribution is loaded from.
 
-    Tokens are dicts that all have a ``type`` field specifying the type of the
-    token.
-
-    """
-    def __init__(self, tree):
-        """Creates a TreeWalker
-
-        :arg tree: the tree to walk
-
+        A string value is not necessarily a filesystem path, since distributions
+        can be loaded from other sources, e.g. arbitrary zip archives. ``None``
+        means the distribution is created in-memory.
         """
-        self.tree = tree
+        raise NotImplementedError()
 
-    def __iter__(self):
-        raise NotImplementedError
+    @property
+    def metadata_version(self):
+        # type: () -> Optional[str]
+        """Value of "Metadata-Version:" in the distribution, if available."""
+        raise NotImplementedError()
 
-    def error(self, msg):
-        """Generates an error token with the given message
+    @property
+    def canonical_name(self):
+        # type: () -> str
+        raise NotImplementedError()
 
-        :arg msg: the error message
+    @property
+    def version(self):
+        # type: () -> DistributionVersion
+        raise NotImplementedError()
 
-        :returns: SerializeError token
+    @property
+    def installer(self):
+        # type: () -> str
+        raise NotImplementedError()
 
+    @property
+    def editable(self):
+        # type: () -> bool
+        raise NotImplementedError()
+
+    @property
+    def local(self):
+        # type: () -> bool
+        raise NotImplementedError()
+
+    @property
+    def in_usersite(self):
+        # type: () -> bool
+        raise NotImplementedError()
+
+
+class BaseEnvironment:
+    """An environment containing distributions to introspect."""
+
+    @classmethod
+    def default(cls):
+        # type: () -> BaseEnvironment
+        raise NotImplementedError()
+
+    @classmethod
+    def from_paths(cls, paths):
+        # type: (Optional[List[str]]) -> BaseEnvironment
+        raise NotImplementedError()
+
+    def get_distribution(self, name):
+        # type: (str) -> Optional[BaseDistribution]
+        """Given a requirement name, return the installed distributions."""
+        raise NotImplementedError()
+
+    def _iter_distributions(self):
+        # type: () -> Iterator[BaseDistribution]
+        """Iterate through installed distributions.
+
+        This function should be implemented by subclass, but never called
+        directly. Use the public ``iter_distribution()`` instead, which
+        implements additional logic to make sure the distributions are valid.
         """
-        return {"type": "SerializeError", "data": msg}
+        raise NotImplementedError()
 
-    def emptyTag(self, namespace, name, attrs, hasChildren=False):
-        """Generates an EmptyTag token
+    def iter_distributions(self):
+        # type: () -> Iterator[BaseDistribution]
+        """Iterate through installed distributions."""
+        for dist in self._iter_distributions():
+            # Make sure the distribution actually comes from a valid Python
+            # packaging distribution. Pip's AdjacentTempDirectory leaves folders
+            # e.g. ``~atplotlib.dist-info`` if cleanup was interrupted. The
+            # valid project name pattern is taken from PEP 508.
+            project_name_valid = re.match(
+                r"^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$",
+                dist.canonical_name,
+                flags=re.IGNORECASE,
+            )
+            if not project_name_valid:
+                logger.warning(
+                    "Ignoring invalid distribution %s (%s)",
+                    dist.canonical_name,
+                    dist.location,
+                )
+                continue
+            yield dist
 
-        :arg namespace: the namespace of the token--can be ``None``
+    def iter_installed_distributions(
+        self,
+        local_only=True,  # type: bool
+        skip=stdlib_pkgs,  # type: Container[str]
+        include_editables=True,  # type: bool
+        editables_only=False,  # type: bool
+        user_only=False,  # type: bool
+    ):
+        # type: (...) -> Iterator[BaseDistribution]
+        """Return a list of installed distributions.
 
-        :arg name: the name of the element
-
-        :arg attrs: the attributes of the element as a dict
-
-        :arg hasChildren: whether or not to yield a SerializationError because
-            this tag shouldn't have children
-
-        :returns: EmptyTag token
-
+        :param local_only: If True (default), only return installations
+        local to the current virtualenv, if in a virtualenv.
+        :param skip: An iterable of canonicalized project names to ignore;
+            defaults to ``stdlib_pkgs``.
+        :param include_editables: If False, don't report editables.
+        :param editables_only: If True, only report editables.
+        :param user_only: If True, only report installations in the user
+        site directory.
         """
-        yield {"type": "EmptyTag", "name": name,
-               "namespace": namespace,
-               "data": attrs}
-        if hasChildren:
-            yield self.error("Void element has children")
-
-    def startTag(self, namespace, name, attrs):
-        """Generates a StartTag token
-
-        :arg namespace: the namespace of the token--can be ``None``
-
-        :arg name: the name of the element
-
-        :arg attrs: the attributes of the element as a dict
-
-        :returns: StartTag token
-
-        """
-        return {"type": "StartTag",
-                "name": name,
-                "namespace": namespace,
-                "data": attrs}
-
-    def endTag(self, namespace, name):
-        """Generates an EndTag token
-
-        :arg namespace: the namespace of the token--can be ``None``
-
-        :arg name: the name of the element
-
-        :returns: EndTag token
-
-        """
-        return {"type": "EndTag",
-                "name": name,
-                "namespace": namespace}
-
-    def text(self, data):
-        """Generates SpaceCharacters and Characters tokens
-
-        Depending on what's in the data, this generates one or more
-        ``SpaceCharacters`` and ``Characters`` tokens.
-
-        For example:
-
-            >>> from html5lib.treewalkers.base import TreeWalker
-            >>> # Give it an empty tree just so it instantiates
-            >>> walker = TreeWalker([])
-            >>> list(walker.text(''))
-            []
-            >>> list(walker.text('  '))
-            [{u'data': '  ', u'type': u'SpaceCharacters'}]
-            >>> list(walker.text(' abc '))  # doctest: +NORMALIZE_WHITESPACE
-            [{u'data': ' ', u'type': u'SpaceCharacters'},
-            {u'data': u'abc', u'type': u'Characters'},
-            {u'data': u' ', u'type': u'SpaceCharacters'}]
-
-        :arg data: the text data
-
-        :returns: one or more ``SpaceCharacters`` and ``Characters`` tokens
-
-        """
-        data = data
-        middle = data.lstrip(spaceCharacters)
-        left = data[:len(data) - len(middle)]
-        if left:
-            yield {"type": "SpaceCharacters", "data": left}
-        data = middle
-        middle = data.rstrip(spaceCharacters)
-        right = data[len(middle):]
-        if middle:
-            yield {"type": "Characters", "data": middle}
-        if right:
-            yield {"type": "SpaceCharacters", "data": right}
-
-    def comment(self, data):
-        """Generates a Comment token
-
-        :arg data: the comment
-
-        :returns: Comment token
-
-        """
-        return {"type": "Comment", "data": data}
-
-    def doctype(self, name, publicId=None, systemId=None):
-        """Generates a Doctype token
-
-        :arg name:
-
-        :arg publicId:
-
-        :arg systemId:
-
-        :returns: the Doctype token
-
-        """
-        return {"type": "Doctype",
-                "name": name,
-                "publicId": publicId,
-                "systemId": systemId}
-
-    def entity(self, name):
-        """Generates an Entity token
-
-        :arg name: the entity name
-
-        :returns: an Entity token
-
-        """
-        return {"type": "Entity", "name": name}
-
-    def unknown(self, nodeType):
-        """Handles unknown node types"""
-        return self.error("Unknown node type: " + nodeType)
-
-
-class NonRecursiveTreeWalker(TreeWalker):
-    def getNodeDetails(self, node):
-        raise NotImplementedError
-
-    def getFirstChild(self, node):
-        raise NotImplementedError
-
-    def getNextSibling(self, node):
-        raise NotImplementedError
-
-    def getParentNode(self, node):
-        raise NotImplementedError
-
-    def __iter__(self):
-        currentNode = self.tree
-        while currentNode is not None:
-            details = self.getNodeDetails(currentNode)
-            type, details = details[0], details[1:]
-            hasChildren = False
-
-            if type == DOCTYPE:
-                yield self.doctype(*details)
-
-            elif type == TEXT:
-                for token in self.text(*details):
-                    yield token
-
-            elif type == ELEMENT:
-                namespace, name, attributes, hasChildren = details
-                if (not namespace or namespace == namespaces["html"]) and name in voidElements:
-                    for token in self.emptyTag(namespace, name, attributes,
-                                               hasChildren):
-                        yield token
-                    hasChildren = False
-                else:
-                    yield self.startTag(namespace, name, attributes)
-
-            elif type == COMMENT:
-                yield self.comment(details[0])
-
-            elif type == ENTITY:
-                yield self.entity(details[0])
-
-            elif type == DOCUMENT:
-                hasChildren = True
-
-            else:
-                yield self.unknown(details[0])
-
-            if hasChildren:
-                firstChild = self.getFirstChild(currentNode)
-            else:
-                firstChild = None
-
-            if firstChild is not None:
-                currentNode = firstChild
-            else:
-                while currentNode is not None:
-                    details = self.getNodeDetails(currentNode)
-                    type, details = details[0], details[1:]
-                    if type == ELEMENT:
-                        namespace, name, attributes, hasChildren = details
-                        if (namespace and namespace != namespaces["html"]) or name not in voidElements:
-                            yield self.endTag(namespace, name)
-                    if self.tree is currentNode:
-                        currentNode = None
-                        break
-                    nextSibling = self.getNextSibling(currentNode)
-                    if nextSibling is not None:
-                        currentNode = nextSibling
-                        break
-                    else:
-                        currentNode = self.getParentNode(currentNode)
+        it = self.iter_distributions()
+        if local_only:
+            it = (d for d in it if d.local)
+        if not include_editables:
+            it = (d for d in it if not d.editable)
+        if editables_only:
+            it = (d for d in it if d.editable)
+        if user_only:
+            it = (d for d in it if d.in_usersite)
+        return (d for d in it if d.canonical_name not in skip)

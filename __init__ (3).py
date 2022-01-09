@@ -1,128 +1,184 @@
+import logging
+import pathlib
 import sys
-import os
-import re
-import importlib
-import warnings
+import sysconfig
+from typing import List, Optional
+
+from pip._internal.models.scheme import SCHEME_KEYS, Scheme
+
+from . import _distutils, _sysconfig
+from .base import (
+    USER_CACHE_DIR,
+    get_major_minor_version,
+    get_src_prefix,
+    site_packages,
+    user_site,
+)
+
+__all__ = [
+    "USER_CACHE_DIR",
+    "get_bin_prefix",
+    "get_bin_user",
+    "get_major_minor_version",
+    "get_platlib",
+    "get_prefixed_libs",
+    "get_purelib",
+    "get_scheme",
+    "get_src_prefix",
+    "site_packages",
+    "user_site",
+]
 
 
-is_pypy = '__pypy__' in sys.builtin_module_names
+logger = logging.getLogger(__name__)
 
 
-warnings.filterwarnings('ignore',
-                        r'.+ distutils\b.+ deprecated',
-                        DeprecationWarning)
+def _default_base(*, user: bool) -> str:
+    if user:
+        base = sysconfig.get_config_var("userbase")
+    else:
+        base = sysconfig.get_config_var("base")
+    assert base is not None
+    return base
 
 
-def warn_distutils_present():
-    if 'distutils' not in sys.modules:
-        return
-    if is_pypy and sys.version_info < (3, 7):
-        # PyPy for 3.6 unconditionally imports distutils, so bypass the warning
-        # https://foss.heptapod.net/pypy/pypy/-/blob/be829135bc0d758997b3566062999ee8b23872b4/lib-python/3/site.py#L250
-        return
-    warnings.warn(
-        "Distutils was imported before Setuptools, but importing Setuptools "
-        "also replaces the `distutils` module in `sys.modules`. This may lead "
-        "to undesirable behaviors or errors. To avoid these issues, avoid "
-        "using distutils directly, ensure that setuptools is installed in the "
-        "traditional way (e.g. not an editable install), and/or make sure "
-        "that setuptools is always imported before distutils.")
+def _warn_if_mismatch(old: pathlib.Path, new: pathlib.Path, *, key: str) -> bool:
+    if old == new:
+        return False
+    issue_url = "https://github.com/pypa/pip/issues/9617"
+    message = (
+        "Value for %s does not match. Please report this to <%s>"
+        "\ndistutils: %s"
+        "\nsysconfig: %s"
+    )
+    logger.debug(message, key, issue_url, old, new)
+    return True
 
 
-def clear_distutils():
-    if 'distutils' not in sys.modules:
-        return
-    warnings.warn("Setuptools is replacing distutils.")
-    mods = [name for name in sys.modules if re.match(r'distutils\b', name)]
-    for name in mods:
-        del sys.modules[name]
+def _log_context(
+    *,
+    user: bool = False,
+    home: Optional[str] = None,
+    root: Optional[str] = None,
+    prefix: Optional[str] = None,
+) -> None:
+    message = (
+        "Additional context:" "\nuser = %r" "\nhome = %r" "\nroot = %r" "\nprefix = %r"
+    )
+    logger.debug(message, user, home, root, prefix)
 
 
-def enabled():
-    """
-    Allow selection of distutils by environment variable.
-    """
-    which = os.environ.get('SETUPTOOLS_USE_DISTUTILS', 'stdlib')
-    return which == 'local'
+def get_scheme(
+    dist_name,  # type: str
+    user=False,  # type: bool
+    home=None,  # type: Optional[str]
+    root=None,  # type: Optional[str]
+    isolated=False,  # type: bool
+    prefix=None,  # type: Optional[str]
+):
+    # type: (...) -> Scheme
+    old = _distutils.get_scheme(
+        dist_name,
+        user=user,
+        home=home,
+        root=root,
+        isolated=isolated,
+        prefix=prefix,
+    )
+    new = _sysconfig.get_scheme(
+        dist_name,
+        user=user,
+        home=home,
+        root=root,
+        isolated=isolated,
+        prefix=prefix,
+    )
 
+    base = prefix or home or _default_base(user=user)
+    warned = []
+    for k in SCHEME_KEYS:
+        # Extra join because distutils can return relative paths.
+        old_v = pathlib.Path(base, getattr(old, k))
+        new_v = pathlib.Path(getattr(new, k))
 
-def ensure_local_distutils():
-    clear_distutils()
-    distutils = importlib.import_module('setuptools._distutils')
-    distutils.__name__ = 'distutils'
-    sys.modules['distutils'] = distutils
-
-    # sanity check that submodules load as expected
-    core = importlib.import_module('distutils.core')
-    assert '_distutils' in core.__file__, core.__file__
-
-
-def do_override():
-    """
-    Ensure that the local copy of distutils is preferred over stdlib.
-
-    See https://github.com/pypa/setuptools/issues/417#issuecomment-392298401
-    for more motivation.
-    """
-    if enabled():
-        warn_distutils_present()
-        ensure_local_distutils()
-
-
-class DistutilsMetaFinder:
-    def find_spec(self, fullname, path, target=None):
-        if path is not None:
-            return
-
-        method_name = 'spec_for_{fullname}'.format(**locals())
-        method = getattr(self, method_name, lambda: None)
-        return method()
-
-    def spec_for_distutils(self):
-        import importlib.abc
-        import importlib.util
-
-        class DistutilsLoader(importlib.abc.Loader):
-
-            def create_module(self, spec):
-                return importlib.import_module('setuptools._distutils')
-
-            def exec_module(self, module):
-                pass
-
-        return importlib.util.spec_from_loader('distutils', DistutilsLoader())
-
-    def spec_for_pip(self):
-        """
-        Ensure stdlib distutils when running under pip.
-        See pypa/pip#8761 for rationale.
-        """
-        if self.pip_imported_during_build():
-            return
-        clear_distutils()
-        self.spec_for_distutils = lambda: None
-
-    @staticmethod
-    def pip_imported_during_build():
-        """
-        Detect if pip is being imported in a build script. Ref #2355.
-        """
-        import traceback
-        return any(
-            frame.f_globals['__file__'].endswith('setup.py')
-            for frame, line in traceback.walk_stack(None)
+        # distutils incorrectly put PyPy packages under ``site-packages/python``
+        # in the ``posix_home`` scheme, but PyPy devs said they expect the
+        # directory name to be ``pypy`` instead. So we treat this as a bug fix
+        # and not warn about it. See bpo-43307 and python/cpython#24628.
+        skip_pypy_special_case = (
+            sys.implementation.name == "pypy"
+            and home is not None
+            and k in ("platlib", "purelib")
+            and old_v.parent == new_v.parent
+            and old_v.name == "python"
+            and new_v.name == "pypy"
         )
+        if skip_pypy_special_case:
+            continue
+
+        warned.append(_warn_if_mismatch(old_v, new_v, key=f"scheme.{k}"))
+
+    if any(warned):
+        _log_context(user=user, home=home, root=root, prefix=prefix)
+
+    return old
 
 
-DISTUTILS_FINDER = DistutilsMetaFinder()
+def get_bin_prefix():
+    # type: () -> str
+    old = _distutils.get_bin_prefix()
+    new = _sysconfig.get_bin_prefix()
+    if _warn_if_mismatch(pathlib.Path(old), pathlib.Path(new), key="bin_prefix"):
+        _log_context()
+    return old
 
 
-def add_shim():
-    sys.meta_path.insert(0, DISTUTILS_FINDER)
+def get_bin_user():
+    # type: () -> str
+    return _sysconfig.get_scheme("", user=True).scripts
 
 
-def remove_shim():
-    try:
-        sys.meta_path.remove(DISTUTILS_FINDER)
-    except ValueError:
-        pass
+def get_purelib():
+    # type: () -> str
+    """Return the default pure-Python lib location."""
+    old = _distutils.get_purelib()
+    new = _sysconfig.get_purelib()
+    if _warn_if_mismatch(pathlib.Path(old), pathlib.Path(new), key="purelib"):
+        _log_context()
+    return old
+
+
+def get_platlib():
+    # type: () -> str
+    """Return the default platform-shared lib location."""
+    old = _distutils.get_platlib()
+    new = _sysconfig.get_platlib()
+    if _warn_if_mismatch(pathlib.Path(old), pathlib.Path(new), key="platlib"):
+        _log_context()
+    return old
+
+
+def get_prefixed_libs(prefix):
+    # type: (str) -> List[str]
+    """Return the lib locations under ``prefix``."""
+    old_pure, old_plat = _distutils.get_prefixed_libs(prefix)
+    new_pure, new_plat = _sysconfig.get_prefixed_libs(prefix)
+
+    warned = [
+        _warn_if_mismatch(
+            pathlib.Path(old_pure),
+            pathlib.Path(new_pure),
+            key="prefixed-purelib",
+        ),
+        _warn_if_mismatch(
+            pathlib.Path(old_plat),
+            pathlib.Path(new_plat),
+            key="prefixed-platlib",
+        ),
+    ]
+    if any(warned):
+        _log_context(prefix=prefix)
+
+    if old_pure == old_plat:
+        return [old_pure]
+    return [old_pure, old_plat]
