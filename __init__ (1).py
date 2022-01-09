@@ -1,49 +1,54 @@
-from __future__ import absolute_import
+# coding: utf-8
+from ._version import version
+from .exceptions import *
+from .ext import ExtType, Timestamp
 
-# For backwards compatibility, provide imports that used to be here.
-from .connection import is_connection_dropped
-from .request import SKIP_HEADER, SKIPPABLE_HEADERS, make_headers
-from .response import is_fp_closed
-from .retry import Retry
-from .ssl_ import (
-    ALPN_PROTOCOLS,
-    HAS_SNI,
-    IS_PYOPENSSL,
-    IS_SECURETRANSPORT,
-    PROTOCOL_TLS,
-    SSLContext,
-    assert_fingerprint,
-    resolve_cert_reqs,
-    resolve_ssl_version,
-    ssl_wrap_socket,
-)
-from .timeout import Timeout, current_time
-from .url import Url, get_host, parse_url, split_first
-from .wait import wait_for_read, wait_for_write
+import os
+import sys
 
-__all__ = (
-    "HAS_SNI",
-    "IS_PYOPENSSL",
-    "IS_SECURETRANSPORT",
-    "SSLContext",
-    "PROTOCOL_TLS",
-    "ALPN_PROTOCOLS",
-    "Retry",
-    "Timeout",
-    "Url",
-    "assert_fingerprint",
-    "current_time",
-    "is_connection_dropped",
-    "is_fp_closed",
-    "get_host",
-    "parse_url",
-    "make_headers",
-    "resolve_cert_reqs",
-    "resolve_ssl_version",
-    "split_first",
-    "ssl_wrap_socket",
-    "wait_for_read",
-    "wait_for_write",
-    "SKIP_HEADER",
-    "SKIPPABLE_HEADERS",
-)
+
+if os.environ.get("MSGPACK_PUREPYTHON") or sys.version_info[0] == 2:
+    from .fallback import Packer, unpackb, Unpacker
+else:
+    try:
+        from ._cmsgpack import Packer, unpackb, Unpacker
+    except ImportError:
+        from .fallback import Packer, unpackb, Unpacker
+
+
+def pack(o, stream, **kwargs):
+    """
+    Pack object `o` and write it to `stream`
+
+    See :class:`Packer` for options.
+    """
+    packer = Packer(**kwargs)
+    stream.write(packer.pack(o))
+
+
+def packb(o, **kwargs):
+    """
+    Pack object `o` and return packed bytes
+
+    See :class:`Packer` for options.
+    """
+    return Packer(**kwargs).pack(o)
+
+
+def unpack(stream, **kwargs):
+    """
+    Unpack an object from `stream`.
+
+    Raises `ExtraData` when `stream` contains extra bytes.
+    See :class:`Unpacker` for options.
+    """
+    data = stream.read()
+    return unpackb(data, **kwargs)
+
+
+# alias for compatibility to simplejson/marshal/pickle.
+load = unpack
+loads = unpackb
+
+dump = pack
+dumps = packb
